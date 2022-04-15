@@ -1,5 +1,5 @@
 # EV3-OpenMV-Stuff
-EV3-OpenMV-Stuff
+An OpenMV software, hardware example for LEGO Mindstroms EV3 (support SPIKE/RI), 
 
 
 ## Documents used
