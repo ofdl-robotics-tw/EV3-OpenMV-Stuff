@@ -5,7 +5,8 @@ Version Date: 01/06/2020
 Tufts Center for Engineering Education and Outreach
 Tufts University
 
-Updated on: 01/06/2020
+Add NACK_TryAttempt function to make sure when communication error, board can reset.
+By Anthony Hsu, Updated on: 23/09/2022
 '''
 import machine, utime, gc
 import math, struct
@@ -22,6 +23,7 @@ CMD_ModeInfo = 0x80  # name command
 CMD_Data  = 0xC0  # data command
 
 CMD_LLL_SHIFT = 3
+NACK_TryAttempt = 8
 
 NAME,RAW,Pct,SI,SYM,FCT, FMT = 0x0,0x1,0x2,0x3,0x4,0x5, 0x80
 DATA8,DATA16,DATA32,DATAF = 0,1,2,3  # Data type codes
@@ -30,21 +32,21 @@ WeDo_Ultrasonic, SPIKE_Color, SPIKE_Ultrasonic = 35, 61, 62
 Ev3_Utrasonic = 34
 
 length = {'Int8' : 1, 'uInt8' : 1, 'Int16' : 2, 'uInt16' : 2, 'Int32' : 4, 'uInt32' : 4, 'float' : 4}
-format = {'Int8' : '<b', 'uInt8' : '<B', 'Int16' : '<h', 'uInt16' : '<H', 
+format = {'Int8' : '<b', 'uInt8' : '<B', 'Int16' : '<h', 'uInt16' : '<H',
      'Int32' : '<l', 'uInt32' : '<L', 'float' : '<f'}
 
-# Name, Format [# datasets, type, figures, decimals], 
+# Name, Format [# datasets, type, figures, decimals],
 # raw [min,max], Percent [min,max], SI [min,max], Symbol, functionMap [type, ?], view
 mode0 = ['LPF2-DETECT',[1,DATA8,3,0],[0,10],[0,100],[0,10],'',[ABSOLUTE,0],True]
 mode1 = ['LPF2-COUNT',[1,DATA32,4,0],[0,100],[0,100],[0,100],'CNT',[ABSOLUTE,0],True]
 mode2 = ['LPF2-CAL',[3,DATA16,3,0],[0,1023],[0,100],[0,1023],'RAW',[ABSOLUTE,0],False]
-defaultModes = [mode0,mode1,mode2]     
+defaultModes = [mode0,mode1,mode2]
 
 def mode(name,size = 1, type=DATA8, format = '3.0',  raw = [0,100], percent = [0,100],  SI = [0,100], symbol = '', functionmap = [ABSOLUTE,0], view = True):
           fig,dec = format.split('.')
           fred = [name, [size,type,int(fig),int(dec)],raw,percent,SI,symbol,functionmap,view]
           return fred
-               
+
 class LPF2(object):
      def __init__(self, uartChannel, txPin, rxPin, modes = defaultModes, type = WeDo_Ultrasonic, timer = 4, freq = 5):
           self.txPin = txPin
@@ -59,12 +61,14 @@ class LPF2(object):
           self.freq = freq
           self.oldbuffer =  bytes([])
           self.textBuffer = bytearray(b'                ')
-          
+          self.LAST_NACK = 0
+          self.LAST_HubCall = 0
+
 # -------- Payload definition
 
-     def load_payload(self, type, array):   # note it must be a power of 2 length          
+     def load_payload(self, type, array):   # note it must be a power of 2 length
           if isinstance(array,list):
-               bit = math.floor(math.log2(length[type]*len(array)))  
+               bit = math.floor(math.log2(length[type]*len(array)))
                bit = 4 if bit > 4 else bit     # max 16 bytes total (4 floats)
                array = array[:math.floor((2**bit)/ length[type])]     # max array size is 16 bytes
                value = b''
@@ -75,7 +79,7 @@ class LPF2(object):
                value = struct.pack(format[type], array)
           payload = bytearray([CMD_Data | (bit << CMD_LLL_SHIFT) | self.current_mode])+value
           self.payload = self.addChksm(payload)
-          
+
 #----- comm stuff
 
      def hubCallback(self, timerInfo):
@@ -85,7 +89,8 @@ class LPF2(object):
                     if chr == 0:   # port has nto been setup yet
                          pass
                     elif chr == BYTE_NACK:     # regular heartbeat pulse
-                         pass   
+                         pass
+                         self.LAST_NACK += 1
                     elif chr == CMD_Select:    # reset the mode
                          mode = self.uart.readchar()
                          cksm = self.uart.readchar()
@@ -118,8 +123,19 @@ class LPF2(object):
                     else:
                          print(chr)
                     chr = self.uart.readchar()
-                    
+
                size = self.writeIt(self.payload)    # send out the latest payload
+
+               self.LAST_HubCall += 1
+               #print(self.LAST_HubCall)
+               print('NACK lost: ', self.LAST_HubCall - self.LAST_NACK - 1)
+
+               if (self.LAST_HubCall - self.LAST_NACK) > NACK_TryAttempt:
+                    self.LAST_HubCall = 0
+                    self.LAST_NACK = 0
+                    self.connected = False
+                    print('NACK Timeout, Reset!')
+
                if not size: self.connected = False
 
      def writeIt(self,array):
@@ -145,11 +161,11 @@ class LPF2(object):
           for b in array:
                chksm ^= b
           chksm ^= 0xFF
-          array.append(chksm)  
+          array.append(chksm)
           return array
 
 # -----  Init and close
-          
+
      def init(self):
           self.tx = machine.Pin(self.txPin, machine.Pin.OUT)
           self.rx = machine.Pin(self.rxPin, machine.Pin.IN)
@@ -164,20 +180,20 @@ class LPF2(object):
           self.sendTimer.callback(None)
           self.connected = False
 
-# ---- settup definitions 
-          
+# ---- settup definitions
+
      def setType(self,sensorType):
           return self.addChksm(bytearray([CMD_Type, sensorType]))
 
      def defineBaud(self,baud):
           rate = baud.to_bytes(4, 'little')
-          return self.addChksm(bytearray([CMD_Baud]) + rate) 
+          return self.addChksm(bytearray([CMD_Baud]) + rate)
 
      def defineVers(self,hardware,software):
           hard = hardware.to_bytes(4, 'big')
           soft = software.to_bytes(4, 'big')
           return self.addChksm(bytearray([CMD_Vers]) + hard + soft)
-          
+
      def padString(self,string, num, startNum):
           reply = bytearray([startNum])  # start with name
           reply += string
@@ -202,7 +218,7 @@ class LPF2(object):
           figures = mode[2] & 0xFF
           decimals = mode[3] & 0xFF
           return self.addChksm(bytearray([CMD_ModeInfo | exp | num, Type, sampleSize, dataType,figures,decimals]))
-     
+
      def buildRange(self,settings, num, rangeType):
           exp = 3 << CMD_LLL_SHIFT
           minVal = struct.pack('<f', settings[0])
@@ -217,7 +233,7 @@ class LPF2(object):
                     views = views + 1
           views = (views - 1) & 0xFF
           return self.addChksm(bytearray([CMD_Mode, length, views]))
-          
+
      def setupMode(self,mode,num):
           self.writeIt(self.padString(mode[0],num,NAME))        # write name
           self.writeIt(self.buildRange(mode[2], num, RAW))      # write RAW range
@@ -226,7 +242,7 @@ class LPF2(object):
           self.writeIt(self.padString(mode[5],num,SYM))          # write symbol
           self.writeIt(self.buildFunctMap(mode[6],num, FCT)) # write Function Map
           self.writeIt(self.buildFormat(mode[1],num, FMT))     # write format
-          
+
 # -----   Start everything up
 
      def initialize(self):
@@ -234,7 +250,7 @@ class LPF2(object):
           self.sendTimer = pyb.Timer(self.txTimer, freq = self.freq)  # default is 200 ms
           self.init()
           self.writeIt(self.setType(self.type))  # set type to 35 (WeDo Ultrasonic) 61 (Spike color), 62 (Spike ultrasonic)
-          self.writeIt(self.defineModes(self.modes))  # tell how many modes 
+          self.writeIt(self.defineModes(self.modes))  # tell how many modes
           self.writeIt(self.defineBaud(115200))
           self.writeIt(self.defineVers(2,2))
           num = len(self.modes) - 1
@@ -242,11 +258,11 @@ class LPF2(object):
                self.setupMode(mode,num)
                num -= 1
                utime.sleep_ms(5)
-               
+
           self.writeIt(b'\x04')  #ACK
           # Check for ACK reply
           self.connected = self.waitFor(b'\x04')
-          print('Success' if self.connected else 'Failed')
+          print('LUMP Init Success!' if self.connected else 'LUMP Init Failed!')
 
           # Reset Serial to High Speed
           # pull pin low
@@ -255,15 +271,15 @@ class LPF2(object):
                tx = machine.Pin(self.txPin, machine.Pin.OUT)
                tx.value(0)
                utime.sleep_ms(10)
-               
+
                #change baudrate
                self.uart.init(baudrate=115200, bits=8, parity=None, stop=1)
                self.load_payload('uInt8',0)
-          
+
                #start callback  - MAKE SURE YOU RESTART THE CHIP EVERY TIME (CMD D) to kill previous callbacks running
                self.sendTimer.callback(self.hubCallback)
           return
-          
+
 class Prime_LPF2(LPF2):
      def init(self):
           self.tx = machine.Pin(self.txPin, machine.Pin.OUT)
@@ -274,7 +290,7 @@ class Prime_LPF2(LPF2):
           self.uart.init(baudrate=2400, bits=8, parity=None, stop=1)
           self.writeIt(b'\x00')
 
-     
+
 class EV3_LPF2(LPF2):
      def init(self):
           self.uart.init(baudrate=2400, bits=8, parity=None, stop=1)
